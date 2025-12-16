@@ -55,7 +55,7 @@ DAY_END = (18, 30)
 
 DEFAULT_LEFTOVER_MIN = 60
 
-DISP_ACCEPTED = {"ANS"}     # можно добавить CONN галкой
+DISP_ACCEPTED = {"ANS", "CONN"}  # принято = ANS + CONN
 DISP_MISSED = {"ABAN"}      # пропущенные
 
 
@@ -335,14 +335,21 @@ def compute_metrics(
     df_shift: pd.DataFrame,
     watched_skills: List[str],
     only_watched_for_missed: bool,
-    treat_conn_as_accepted: bool,
 ) -> Dict[str, pd.DataFrame]:
+    """
+    KPI и витрины для UI.
+
+    Принято = ANS + CONN
+    Пропущено = ABAN (опционально только по выбранным skills)
+    Пропущено без оператора = ABAN, где agent_code пустой
+    Прочие статусы = все остальные disposition (FDISC/FBUSY/...)
+    """
     if df_shift.empty:
         return {"events": df_shift}
 
     df = df_shift.copy()
-    accepted_set = set(DISP_ACCEPTED) | ({"CONN"} if treat_conn_as_accepted else set())
 
+    accepted_set = set(DISP_ACCEPTED)  # ANS + CONN
     df["is_accepted"] = df["disposition"].isin(accepted_set)
     df["is_missed"] = df["disposition"].isin(DISP_MISSED)
 
@@ -350,33 +357,53 @@ def compute_metrics(
         df["is_missed"] = df["is_missed"] & df["skill_code"].isin(watched_skills)
 
     df["is_missed_no_agent"] = df["is_missed"] & (df["agent_code"].astype(str).str.strip() == "")
+    df["is_other"] = ~(df["is_accepted"] | df["is_missed"])
 
-    # KPI
+    # KPI (состав событий)
     accepted = int(df["is_accepted"].sum())
-    missed = int(df["is_missed"].sum())
+    missed_total = int(df["is_missed"].sum())
     missed_no_agent = int(df["is_missed_no_agent"].sum())
-    denom = accepted + missed
-    pct_missed = 0.0 if denom == 0 else round(100.0 * missed / denom, 2)
+    missed_by_agent = int(max(missed_total - missed_no_agent, 0))
+    other = int(df["is_other"].sum())
+    total = int(len(df))
+
+    denom_calls = accepted + missed_total
+    pct_missed_calls = 0.0 if denom_calls == 0 else round(100.0 * missed_total / denom_calls, 2)
+    pct_missed_all = 0.0 if total == 0 else round(100.0 * missed_total / total, 2)
+    pct_no_agent_in_missed = 0.0 if missed_total == 0 else round(100.0 * missed_no_agent / missed_total, 2)
 
     kpi = pd.DataFrame([{
-        "Принято": accepted,
-        "Пропущено": missed,
+        "Принято (ANS+CONN)": accepted,
+        "Пропущено всего (ABAN)": missed_total,
+        "Пропущено оператором": missed_by_agent,
         "Пропущено без оператора": missed_no_agent,
-        "% пропущенных": pct_missed,
-        "Всего событий": int(len(df)),
+        "Прочие статусы": other,
+        "Всего событий": total,
+        "% пропущенных от (принято+пропущено)": pct_missed_calls,
+        "% пропущенных от всех событий": pct_missed_all,
+        "% без оператора среди ABAN": pct_no_agent_in_missed,
     }])
 
-    # Timeseries
+    # Timeseries (по получасам)
     ts = (
         df.groupby("slot", dropna=False)
         .agg(
             Принято=("is_accepted", "sum"),
             Пропущено=("is_missed", "sum"),
             Пропущено_без_оператора=("is_missed_no_agent", "sum"),
+            Прочие_статусы=("is_other", "sum"),
             Всего=("disposition", "size"),
         )
         .reset_index()
         .sort_values("slot")
+    )
+
+    # Сводка по статусам (для пояснений)
+    disp = (
+        df.groupby("disposition", dropna=False)
+        .size()
+        .reset_index(name="Кол-во")
+        .sort_values("Кол-во", ascending=False)
     )
 
     # Operators
@@ -418,12 +445,13 @@ def compute_metrics(
         .sort_values(["Пропущено", "Принято"], ascending=[False, False])
     )
 
-    # Bad slots
-    bad = ts[(ts["Пропущено"] > 0) & (ts["Принято"] == 0)][["slot", "Пропущено", "Пропущено_без_оператора", "Всего"]]
+    # Bad slots (пропущено > 0 и принято = 0)
+    bad = ts[(ts["Пропущено"] > 0) & (ts["Принято"] == 0)][["slot", "Пропущено", "Пропущено_без_оператора", "Прочие_статусы", "Всего"]]
 
     return {
         "kpi": kpi,
         "timeseries": ts,
+        "dispositions": disp,
         "operators": ops,
         "pivot_accepted": piv_acc,
         "pivot_missed": piv_mis,
@@ -431,7 +459,6 @@ def compute_metrics(
         "bad_slots": bad,
         "events": df.sort_values("dt_start").reset_index(drop=True),
     }
-
 
 def safe_reindex_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Главный фикс твоего KeyError: даже если колонки отсутствуют — добавим их с нулями."""
@@ -480,7 +507,6 @@ with st.sidebar:
 
     st.divider()
     st.header("Правила")
-    treat_conn_as_accepted = st.checkbox("Считать CONN как 'Принято'", value=False)
     only_watched_for_missed = st.checkbox("Пропущено считать только по skills", value=(mode == "night"))
     watched_skills = st.multiselect("Skills для пропущенных", options=sorted(set(WATCHED_SKILLS_DEFAULT)), default=WATCHED_SKILLS_DEFAULT)
 
@@ -494,6 +520,7 @@ with st.sidebar:
     top_n = st.slider("Топ N", 3, 30, 10)
     max_pivot_cols = st.slider("Макс операторов в матрице", 3, 60, 15)
     show_raw = st.checkbox("Показывать сырые события", value=False)
+    show_explain = st.checkbox("Пояснения для новичков (что означает каждая цифра)", value=True)
 
     st.divider()
     st.header("Операторы (код → имя)")
@@ -584,7 +611,6 @@ metrics = compute_metrics(
     df_shift=df_shift,
     watched_skills=[str(x) for x in watched_skills],
     only_watched_for_missed=only_watched_for_missed,
-    treat_conn_as_accepted=treat_conn_as_accepted,
 )
 
 # Заголовок окна
@@ -599,16 +625,48 @@ if excluded:
 
 # KPI
 kpi = metrics["kpi"].iloc[0].to_dict()
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Принято", int(kpi["Принято"]))
-c2.metric("Пропущено", int(kpi["Пропущено"]))
-c3.metric("Без оператора", int(kpi["Пропущено без оператора"]))
-c4.metric("% пропущенных", f'{kpi["% пропущенных"]}%')
-c5.metric("Всего", int(kpi["Всего событий"]))
+
+# Главные цифры — чтобы они "складывались" понятно
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1.metric("Принято", int(kpi["Принято (ANS+CONN)"]), help="Считаем как ANS + CONN")
+col2.metric("Пропущено (ABAN)", int(kpi["Пропущено всего (ABAN)"]), help="ABAN. Если включён фильтр skills — считаем только по выбранным skills")
+col3.metric("ABAN оператором", int(kpi["Пропущено оператором"]), help="ABAN, где указан оператор (agent заполнен)")
+col4.metric("ABAN без оператора", int(kpi["Пропущено без оператора"]), help="ABAN, где оператор не указан (agent пустой)")
+col5.metric("Прочие статусы", int(kpi["Прочие статусы"]), help="FDISC/FBUSY/… — всё, что не ANS/CONN и не ABAN")
+col6.metric("Всего событий", int(kpi["Всего событий"]), help="Принято + ABAN + Прочие статусы (в рамках выбранной смены)")
+
+if show_explain:
+    st.markdown("#### Как читать эти цифры")
+    st.markdown(
+        """
+- **Всего событий** = **Принято (ANS+CONN)** + **Пропущено (ABAN)** + **Прочие статусы**  
+- **% пропущенных** (основная метрика) = **ABAN / (ANS+CONN + ABAN)**  
+- **ABAN без оператора** — это часть ABAN, где `agent` пустой (обычно особенности очереди/маршрутизации), поэтому показываем отдельно
+        """
+    )
+
+    breakdown = pd.DataFrame([
+        {"Компонент": "Принято (ANS+CONN)", "Кол-во": int(kpi["Принято (ANS+CONN)"])},
+        {"Компонент": "Пропущено оператором (ABAN + agent)", "Кол-во": int(kpi["Пропущено оператором"])},
+        {"Компонент": "Пропущено без оператора (ABAN без agent)", "Кол-во": int(kpi["Пропущено без оператора"])},
+        {"Компонент": "Прочие статусы (FDISC/FBUSY/…)", "Кол-во": int(kpi["Прочие статусы"])},
+    ])
+    breakdown.loc[len(breakdown)] = {"Компонент": "ИТОГО (должно = Всего событий)", "Кол-во": int(breakdown["Кол-во"].sum())}
+    st.dataframe(breakdown, use_container_width=True)
+
+    pct_tbl = pd.DataFrame([{
+        "% пропущенных (ABAN / (ANS+CONN + ABAN))": f'{kpi["% пропущенных от (принято+пропущено)"]}%',
+        "% пропущенных от всех событий": f'{kpi["% пропущенных от всех событий"]}%',
+        "% ABAN без оператора среди ABAN": f'{kpi["% без оператора среди ABAN"]}%',
+    }])
+    st.dataframe(pct_tbl, use_container_width=True)
+
+    st.markdown("#### Какие статусы встречаются в файле")
+    st.dataframe(metrics["dispositions"], use_container_width=True)
 
 # Динамика
 st.markdown("### Динамика по получасам")
-ts = metrics["timeseries"].set_index("slot")[["Принято", "Пропущено", "Пропущено_без_оператора"]]
+ts = metrics["timeseries"].set_index("slot")[["Принято", "Пропущено", "Прочие_статусы", "Пропущено_без_оператора"]]
 st.line_chart(ts)
 
 # Топы
