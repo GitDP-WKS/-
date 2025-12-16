@@ -1,0 +1,5 @@
+streamlit>=1.36
+pandas>=2.2
+beautifulsoup4>=4.12
+lxml>=5.2
+openpyxl>=3.1
