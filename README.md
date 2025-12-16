@@ -1,18 +1,7 @@
-# Avaya CMS Shift Analyzer (Streamlit)
-
-## Как запустить локально
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Как использовать
-1. Загрузи HTML отчёт Avaya (Call Records).
-2. Выбери смену (Ночь / День) и дату смены (если в HTML несколько дней).
-3. При необходимости включи фильтр пропущенных только по skills (1/3/9 и т.п.).
-4. Маппинг операторов (код→имя) можно дополнять:
-   - вставкой текста из реестра (берём только строки `Оператор - ... (код)`)
-   - загрузкой CSV/XLSX
-   - редактором (по кнопке)
-
-По умолчанию **Принято = ANS + CONN**.
+# Avaya Shift Analyzer (minimal)
+- Upload Avaya HTML (Call Records)
+- Choose shift: Night/Day
+- Choose shift date (or all)
+- Accepted = ANS + CONN
+- Missed = ABAN for selected skills (default 1/3/9)
+- Optional operator mapping upload (CSV/XLSX)

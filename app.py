@@ -1,16 +1,9 @@
 
-# app_shift_unified_v3.py
-# Streamlit: универсальный анализатор Avaya CMS Call Records (ночь/день/мульти-дни)
+# app.py — минимальный “неубиваемый” анализатор Avaya Call Records (ночь/день)
+# Принято = ANS + CONN
+# Пропущено = ABAN (можно ограничить по skills 1/3/9)
 #
-# Запуск:
-#   pip install streamlit pandas beautifulsoup4 openpyxl lxml
-#   streamlit run app_shift_unified_v3.py
-#
-# Основное:
-# - Ночь/День кнопками (ночь по умолчанию, как было)
-# - Если в HTML несколько дней: появляется выбор "дата смены" или "все смены в файле"
-# - Маппинг операторов (код->имя): встроенный + загрузка CSV/XLSX + вставка текста из реестра
-# - Максимально "неубиваемый": все опасные места защищены, pivot reindex (без KeyError)
+# Streamlit Cloud: положи этот файл как app.py + requirements.txt
 
 from __future__ import annotations
 
@@ -18,45 +11,25 @@ import io
 import re
 from dataclasses import dataclass
 from datetime import datetime, date, time, timedelta
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
 
-# -------------------------
-# Встроенный маппинг (из твоих скринов)
-# Только "Оператор - ... (КОД)" — номера станций/телефонов не нужны
-# -------------------------
-DEFAULT_AGENT_MAP: Dict[str, str] = {
-    "7599449": "Абусаитов ДМ",
-    "7599415": "Аспенбетова АА",
-    "7599497": "Ахметзянова РР",
-    "7599437": "Воронцов ВВ",
-    "7599458": "Гайфуллина ДИ",
-    "7599473": "Галиева АР",
-    "7599413": "Гараев РР",
-    "7599498": "Заббаров АИ",
-    "7599405": "Зайнудтинова ЛС",
-    "7599411": "Ибрагимова ЛИ",
-    "7599403": "Минибаева АИ",
-    "7599408": "Сагетдинов МИ",
-    "7599478": "Хузахметов АР",
-}
+# -------------------- БАЗОВЫЕ НАСТРОЙКИ --------------------
 
 WATCHED_SKILLS_DEFAULT = ["1", "3", "9"]
-SKILL_NAMES_DEFAULT = {"1": "Надежность", "3": "Качество э/э", "9": "ЭЗС"}
+SKILL_NAMES = {"1": "Надежность", "3": "Качество э/э", "9": "ЭЗС"}
+
+ACCEPTED = {"ANS", "CONN"}
+MISSED = {"ABAN"}
 
 NIGHT_START = (18, 30)
 NIGHT_END = (6, 30)
 DAY_START = (6, 30)
 DAY_END = (18, 30)
-
-DEFAULT_LEFTOVER_MIN = 60
-
-DISP_ACCEPTED = {"ANS", "CONN"}  # принято = ANS + CONN
-DISP_MISSED = {"ABAN"}      # пропущенные
 
 
 @dataclass(frozen=True)
@@ -64,83 +37,60 @@ class ShiftSpec:
     name: str
     start_hm: Tuple[int, int]
     end_hm: Tuple[int, int]
-    crosses_midnight: Optional[bool] = None  # None -> auto (end<=start)
 
-    def bounds(self, base_date: date) -> Tuple[datetime, datetime]:
-        start_dt = datetime.combine(base_date, time(self.start_hm[0], self.start_hm[1]))
-        end_dt = datetime.combine(base_date, time(self.end_hm[0], self.end_hm[1]))
-        crosses = (end_dt <= start_dt) if self.crosses_midnight is None else self.crosses_midnight
-        if crosses:
-            end_dt += timedelta(days=1)
-        return start_dt, end_dt
+    def bounds(self, base: date) -> Tuple[datetime, datetime]:
+        s = datetime.combine(base, time(self.start_hm[0], self.start_hm[1]))
+        e = datetime.combine(base, time(self.end_hm[0], self.end_hm[1]))
+        if e <= s:  # через полночь
+            e += timedelta(days=1)
+        return s, e
 
 
-SHIFT_PRESETS = {
-    "night": ShiftSpec("Ночная (18:30–06:30)", NIGHT_START, NIGHT_END, None),
-    "day": ShiftSpec("Дневная (06:30–18:30)", DAY_START, DAY_END, False),
-    "custom": ShiftSpec("Кастом", NIGHT_START, NIGHT_END, None),
-}
+SHIFT_NIGHT = ShiftSpec("Ночь (18:30–06:30)", NIGHT_START, NIGHT_END)
+SHIFT_DAY = ShiftSpec("День (06:30–18:30)", DAY_START, DAY_END)
 
 
-# -------------------------
-# Надежные утилиты
-# -------------------------
+# -------------------- УТИЛИТЫ --------------------
 
-def _safe_decode(data: bytes) -> str:
+def safe_decode(b: bytes) -> str:
     for enc in ("cp1251", "windows-1251", "utf-8", "latin-1"):
         try:
-            return data.decode(enc)
+            return b.decode(enc)
         except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    return b.decode("utf-8", errors="replace")
 
 
-def _clean_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = s.replace("\xa0", " ").strip()
-    return "" if s in {"&nbsp;", "\u00a0"} else s
+def clean_txt(s: str) -> str:
+    return (s or "").replace("\xa0", " ").strip()
 
 
-def _first_existing_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _find_target_table(soup: BeautifulSoup):
+def find_best_table(soup: BeautifulSoup):
+    """Берём таблицу, которая больше всего похожа на Avaya Call Records."""
     tables = soup.find_all("table")
     if not tables:
         return None
 
     def score(tbl) -> int:
-        ths = [(_clean_text(th.get_text(" ", strip=True)) or "").lower() for th in tbl.find_all("th")]
-        if not ths:
-            return 0
-        s = 0
-        for key in ("id вызова", "размещение", "split/skill", "имена пользователей", "время нач"):
-            if any(key in th for th in ths):
-                s += 3
-        s += min(len(ths), 40) // 4
-        return s
+        th = [clean_txt(x.get_text(" ", strip=True)).lower() for x in tbl.find_all("th")]
+        if not th:
+            return -999
+        keys = ["дата", "время", "размещение", "split/skill", "имена пользователей"]
+        return sum(any(k in h for h in th) for k in keys) * 10 + len(th)
 
-    best = max(tables, key=score)
-    if score(best) == 0:
-        return None
-    return best
+    return max(tables, key=score)
 
 
 @st.cache_data(show_spinner=False)
-def parse_avaya_html(html_bytes: bytes) -> pd.DataFrame:
+def parse_html_to_raw_df(html_bytes: bytes) -> pd.DataFrame:
     try:
-        text = _safe_decode(html_bytes)
-        soup = BeautifulSoup(text, "lxml")  # lxml обычно лучше Avaya-таблицы
-        tbl = _find_target_table(soup)
+        html = safe_decode(html_bytes)
+        soup = BeautifulSoup(html, "html.parser")
+        tbl = find_best_table(soup)
         if tbl is None:
             return pd.DataFrame()
 
-        headers = [_clean_text(th.get_text(" ", strip=True)) for th in tbl.find_all("th")]
+        headers = [clean_txt(th.get_text(" ", strip=True)) for th in tbl.find_all("th")]
         if not headers:
             return pd.DataFrame()
 
@@ -149,7 +99,7 @@ def parse_avaya_html(html_bytes: bytes) -> pd.DataFrame:
             tds = tr.find_all("td")
             if not tds:
                 continue
-            row = [_clean_text(td.get_text(" ", strip=True)) for td in tds]
+            row = [clean_txt(td.get_text(" ", strip=True)) for td in tds]
             # выравниваем под headers
             if len(row) < len(headers):
                 row += [""] * (len(headers) - len(row))
@@ -162,566 +112,272 @@ def parse_avaya_html(html_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def normalize_calls(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Приводим к каноническим колонкам: dt_start, disposition, agent_code, skill_code, call_date, slot"""
-    if df_raw.empty:
-        return pd.DataFrame()
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    col_date = _first_existing_col(df_raw, ["Дата", "Date"])
-    col_time = _first_existing_col(df_raw, ["Время нач.", "Время нач", "Time"])
-    col_disp = _first_existing_col(df_raw, ["Размещение", "Disposition"])
-    col_skill = _first_existing_col(df_raw, ["Split/Skill", "Skill", "Split"])
-    col_agent = _first_existing_col(df_raw, ["Имена пользователей", "Agent", "Пользователь", "User"])
+
+def normalize(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Нормализация к единому формату: dt_start, disposition, skill_code, agent_code."""
+    if df_raw.empty:
+        return df_raw
+
+    df = df_raw.copy()
+
+    col_date = pick_col(df, ["Дата", "Date"])
+    col_time = pick_col(df, ["Время нач.", "Время нач", "Time"])
+    col_disp = pick_col(df, ["Размещение", "Disposition"])
+    col_skill = pick_col(df, ["Split/Skill", "Skill", "Split"])
+    col_agent = pick_col(df, ["Имена пользователей", "Agent", "Пользователь", "User"])
 
     if not (col_date and col_time and col_disp):
         return pd.DataFrame()
 
-    df = df_raw.copy()
     dt_str = (df[col_date].astype(str).str.strip() + " " + df[col_time].astype(str).str.strip()).str.strip()
     df["dt_start"] = pd.to_datetime(dt_str, format="%d.%m.%Y %H:%M:%S", errors="coerce")
     df = df.dropna(subset=["dt_start"]).reset_index(drop=True)
 
     df["disposition"] = df[col_disp].astype(str).str.strip().str.upper()
     df["skill_raw"] = "" if col_skill is None else df[col_skill].astype(str).str.strip()
+    df["skill_code"] = df["skill_raw"].str.extract(r"(\d+)", expand=False).fillna("").astype(str)
     df["agent_code"] = "" if col_agent is None else df[col_agent].astype(str).str.strip()
 
-    df["skill_code"] = df["skill_raw"].str.extract(r"(\d+)", expand=False).fillna("").astype(str)
     df["call_date"] = df["dt_start"].dt.date
-
-    # слот (получас)
-    df["slot"] = df["dt_start"].apply(lambda x: pd.Timestamp(x).replace(minute=(0 if x.minute < 30 else 30), second=0, microsecond=0))
-
     return df
 
 
-def extract_agents_from_registry_text(text: str) -> Dict[str, str]:
-    """
-    Парсим только строки вида:
-      "Оператор - Фамилия ИО (7599413)"
-    Всё остальное (Телефон, станции и т.п.) игнорируем.
-    """
-    if not text:
-        return {}
-    out: Dict[str, str] = {}
-    # допускаем пробелы, тире, двойные пробелы
-    pattern = re.compile(r"Оператор\s*-\s*([^(]+)\((\d{5,12})\)", re.IGNORECASE)
-    for line in text.splitlines():
-        line = line.strip()
-        m = pattern.search(line)
-        if not m:
-            continue
-        name = m.group(1).strip()
-        code = m.group(2).strip()
-        if code and name:
-            out[code] = name
-    return out
-
-
-def load_mapping_file(uploaded) -> Dict[str, str]:
+def load_mapping(uploaded) -> Dict[str, str]:
+    """CSV/XLSX: 1-я колонка = code, 2-я = name (или распознаём по заголовкам)."""
     if uploaded is None:
         return {}
     try:
-        name = getattr(uploaded, "name", "").lower()
+        name = (getattr(uploaded, "name", "") or "").lower()
         data = uploaded.getvalue()
-
-        if name.endswith(".csv") or name.endswith(".txt"):
-            df = None
+        if name.endswith(".xlsx") or name.endswith(".xls"):
+            mdf = pd.read_excel(io.BytesIO(data), dtype=str).fillna("")
+        else:
+            # CSV / txt
+            mdf = None
             for sep in [",", ";", "\t"]:
                 try:
-                    df = pd.read_csv(io.BytesIO(data), sep=sep, dtype=str)
-                    if df is not None and df.shape[1] >= 2:
+                    tmp = pd.read_csv(io.BytesIO(data), sep=sep, dtype=str).fillna("")
+                    if tmp.shape[1] >= 2:
+                        mdf = tmp
                         break
                 except Exception:
-                    df = None
-            if df is None:
+                    pass
+            if mdf is None:
                 return {}
-        else:
-            df = pd.read_excel(io.BytesIO(data), dtype=str)
 
-        df = df.fillna("")
-        cols = [c.lower().strip() for c in df.columns]
-        # пробуем угадать
-        code_col = None
-        name_col = None
-        for c, raw in zip(cols, df.columns):
-            if code_col is None and any(k in c for k in ["agent", "code", "номер", "id", "код"]):
-                code_col = raw
-            if name_col is None and any(k in c for k in ["name", "имя", "фио"]):
-                name_col = raw
+        cols = [c.lower().strip() for c in mdf.columns]
+        code_i = None
+        name_i = None
+        for i, c in enumerate(cols):
+            if code_i is None and any(k in c for k in ["код", "agent", "id", "номер", "code"]):
+                code_i = i
+            if name_i is None and any(k in c for k in ["имя", "фио", "name"]):
+                name_i = i
+        if code_i is None or name_i is None:
+            code_i, name_i = 0, 1
 
-        if code_col is None or name_col is None:
-            code_col, name_col = df.columns[0], df.columns[1]
+        code_col = mdf.columns[code_i]
+        name_col = mdf.columns[name_i]
 
-        mapping: Dict[str, str] = {}
-        for _, r in df.iterrows():
+        mp: Dict[str, str] = {}
+        for _, r in mdf.iterrows():
             code = str(r[code_col]).strip()
             nm = str(r[name_col]).strip()
             if code and nm:
-                mapping[code] = nm
-        return mapping
+                mp[code] = nm
+        return mp
     except Exception:
         return {}
 
 
-def apply_agent_map(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+def apply_mapping(df: pd.DataFrame, mp: Dict[str, str]) -> pd.DataFrame:
     df = df.copy()
-    if df.empty:
-        return df
-    df["agent_name"] = df["agent_code"].astype(str).map(mapping).fillna(df["agent_code"].astype(str))
+    df["agent_name"] = df["agent_code"].astype(str).map(mp).fillna(df["agent_code"].astype(str))
     return df
 
 
-def available_shift_dates(df: pd.DataFrame, shift: ShiftSpec) -> List[date]:
+def shift_dates(df: pd.DataFrame, shift: ShiftSpec) -> List[date]:
+    """Даты, где реально есть события внутри окна смены."""
     if df.empty:
         return []
-    base_dates = sorted(set(df["call_date"].tolist()))
-    ok = []
-    for bd in base_dates:
-        st_dt, en_dt = shift.bounds(bd)
-        m = (df["dt_start"] >= pd.Timestamp(st_dt)) & (df["dt_start"] < pd.Timestamp(en_dt))
+    dates = sorted(set(df["call_date"].tolist()))
+    out = []
+    for d in dates:
+        s, e = shift.bounds(d)
+        m = (df["dt_start"] >= s) & (df["dt_start"] < e)
         if m.any():
-            ok.append(bd)
-    return ok
+            out.append(d)
+    return out
 
 
-def filter_by_shift(df: pd.DataFrame, shift: ShiftSpec, base_date: Optional[date]) -> Tuple[pd.DataFrame, Optional[Tuple[datetime, datetime]]]:
+def filter_shift(df: pd.DataFrame, shift: ShiftSpec, base: Optional[date]) -> Tuple[pd.DataFrame, Optional[Tuple[datetime, datetime]]]:
     if df.empty:
         return df, None
 
-    if base_date is None:
-        dates = available_shift_dates(df, shift)
-        if not dates:
+    if base is None:
+        ds = shift_dates(df, shift)
+        if not ds:
             return df.iloc[0:0].copy(), None
         parts = []
-        for d in dates:
-            st_dt, en_dt = shift.bounds(d)
-            m = (df["dt_start"] >= pd.Timestamp(st_dt)) & (df["dt_start"] < pd.Timestamp(en_dt))
-            parts.append(df.loc[m])
-        out = pd.concat(parts, ignore_index=True) if parts else df.iloc[0:0].copy()
-        st_dt = shift.bounds(dates[0])[0]
-        en_dt = shift.bounds(dates[-1])[1]
-        return out, (st_dt, en_dt)
+        for d in ds:
+            s, e = shift.bounds(d)
+            parts.append(df[(df["dt_start"] >= s) & (df["dt_start"] < e)])
+        return pd.concat(parts, ignore_index=True), (shift.bounds(ds[0])[0], shift.bounds(ds[-1])[1])
 
-    st_dt, en_dt = shift.bounds(base_date)
-    m = (df["dt_start"] >= pd.Timestamp(st_dt)) & (df["dt_start"] < pd.Timestamp(en_dt))
-    return df.loc[m].copy().reset_index(drop=True), (st_dt, en_dt)
+    s, e = shift.bounds(base)
+    return df[(df["dt_start"] >= s) & (df["dt_start"] < e)].copy().reset_index(drop=True), (s, e)
 
 
-def drop_leftovers(df_shift: pd.DataFrame, window: Tuple[datetime, datetime], minutes: int) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Исключаем операторов, которые появлялись только в первые minutes минут смены и потом исчезли.
-    """
-    if df_shift.empty:
-        return df_shift, []
-    st_dt, _ = window
-    cutoff = st_dt + timedelta(minutes=minutes)
+def compute(df: pd.DataFrame, watched_skills: List[str]) -> Dict[str, pd.DataFrame]:
+    """Считаем понятные метрики. Принято=ANS+CONN."""
+    out: Dict[str, pd.DataFrame] = {}
+    if df.empty:
+        return {"events": df}
 
-    agents = df_shift.loc[df_shift["agent_code"].astype(str).str.strip() != "", "agent_code"].astype(str).unique().tolist()
-    excluded: List[str] = []
-    for a in agents:
-        df_a = df_shift[df_shift["agent_code"] == a]
-        if df_a.empty:
-            continue
-        last = df_a["dt_start"].max()
-        if last < cutoff:
-            excluded.append(a)
+    d = df.copy()
 
-    if excluded:
-        df_shift = df_shift[~df_shift["agent_code"].isin(excluded)].copy().reset_index(drop=True)
-    return df_shift, excluded
+    d["is_accepted"] = d["disposition"].isin(ACCEPTED)
+    d["is_missed"] = d["disposition"].isin(MISSED)
+    d["is_missed_watched"] = d["is_missed"] & d["skill_code"].isin(watched_skills)
+    d["missed_no_agent"] = d["is_missed_watched"] & (d["agent_code"].str.strip() == "")
+    d["missed_with_agent"] = d["is_missed_watched"] & (d["agent_code"].str.strip() != "")
+    d["is_other"] = ~(d["disposition"].isin(ACCEPTED | MISSED))
 
-
-def compute_metrics(
-    df_shift: pd.DataFrame,
-    watched_skills: List[str],
-    only_watched_for_missed: bool,
-) -> Dict[str, pd.DataFrame]:
-    """
-    KPI и витрины для UI.
-
-    Принято = ANS + CONN
-    Пропущено = ABAN (опционально только по выбранным skills)
-    Пропущено без оператора = ABAN, где agent_code пустой
-    Прочие статусы = все остальные disposition (FDISC/FBUSY/...)
-    """
-    if df_shift.empty:
-        return {"events": df_shift}
-
-    df = df_shift.copy()
-
-    accepted_set = set(DISP_ACCEPTED)  # ANS + CONN
-    df["is_accepted"] = df["disposition"].isin(accepted_set)
-    df["is_missed"] = df["disposition"].isin(DISP_MISSED)
-
-    if only_watched_for_missed and watched_skills:
-        df["is_missed"] = df["is_missed"] & df["skill_code"].isin(watched_skills)
-
-    df["is_missed_no_agent"] = df["is_missed"] & (df["agent_code"].astype(str).str.strip() == "")
-    df["is_other"] = ~(df["is_accepted"] | df["is_missed"])
-
-    # KPI (состав событий)
-    accepted = int(df["is_accepted"].sum())
-    missed_total = int(df["is_missed"].sum())
-    missed_no_agent = int(df["is_missed_no_agent"].sum())
-    missed_by_agent = int(max(missed_total - missed_no_agent, 0))
-    other = int(df["is_other"].sum())
-    total = int(len(df))
-
-    denom_calls = accepted + missed_total
-    pct_missed_calls = 0.0 if denom_calls == 0 else round(100.0 * missed_total / denom_calls, 2)
-    pct_missed_all = 0.0 if total == 0 else round(100.0 * missed_total / total, 2)
-    pct_no_agent_in_missed = 0.0 if missed_total == 0 else round(100.0 * missed_no_agent / missed_total, 2)
-
-    kpi = pd.DataFrame([{
-        "Принято (ANS+CONN)": accepted,
-        "Пропущено всего (ABAN)": missed_total,
-        "Пропущено оператором": missed_by_agent,
-        "Пропущено без оператора": missed_no_agent,
-        "Прочие статусы": other,
-        "Всего событий": total,
-        "% пропущенных от (принято+пропущено)": pct_missed_calls,
-        "% пропущенных от всех событий": pct_missed_all,
-        "% без оператора среди ABAN": pct_no_agent_in_missed,
-    }])
-
-    # Timeseries (по получасам)
-    ts = (
-        df.groupby("slot", dropna=False)
-        .agg(
-            Принято=("is_accepted", "sum"),
-            Пропущено=("is_missed", "sum"),
-            Пропущено_без_оператора=("is_missed_no_agent", "sum"),
-            Прочие_статусы=("is_other", "sum"),
-            Всего=("disposition", "size"),
-        )
-        .reset_index()
-        .sort_values("slot")
-    )
-
-    # Сводка по статусам (для пояснений)
-    disp = (
-        df.groupby("disposition", dropna=False)
-        .size()
-        .reset_index(name="Кол-во")
-        .sort_values("Кол-во", ascending=False)
-    )
-
-    # Operators
-    df_with_agent = df[df["agent_code"].astype(str).str.strip() != ""].copy()
-    if df_with_agent.empty:
-        ops = pd.DataFrame(columns=["agent_name", "Принято", "Пропущено", "% пропущенных"])
-    else:
-        ops = (
-            df_with_agent.groupby(["agent_name"], dropna=False)
-            .agg(Принято=("is_accepted", "sum"), Пропущено=("is_missed", "sum"))
-            .reset_index()
-        )
-        denom2 = (ops["Принято"] + ops["Пропущено"]).replace(0, pd.NA)
-        ops["% пропущенных"] = (100.0 * ops["Пропущено"] / denom2).fillna(0.0).round(2)
-        ops = ops.sort_values(["Пропущено", "Принято"], ascending=[False, False])
-
-    # Pivot (важно: без KeyError)
-    if df_with_agent.empty:
-        piv_acc = pd.DataFrame()
-        piv_mis = pd.DataFrame()
-    else:
-        piv_acc = (
-            df_with_agent[df_with_agent["is_accepted"]]
-            .pivot_table(index="slot", columns="agent_name", values="is_accepted", aggfunc="sum", fill_value=0)
-            .sort_index()
-        )
-        piv_mis = (
-            df_with_agent[df_with_agent["is_missed"]]
-            .pivot_table(index="slot", columns="agent_name", values="is_missed", aggfunc="sum", fill_value=0)
-            .sort_index()
-        )
-
-    # Skills
-    df["skill_name"] = df["skill_code"].map(SKILL_NAMES_DEFAULT).fillna(df["skill_code"].replace("", "Без тематики"))
-    skills = (
-        df.groupby(["skill_name"], dropna=False)
-        .agg(Принято=("is_accepted", "sum"), Пропущено=("is_missed", "sum"))
-        .reset_index()
-        .sort_values(["Пропущено", "Принято"], ascending=[False, False])
-    )
-
-    # Bad slots (пропущено > 0 и принято = 0)
-    bad = ts[(ts["Пропущено"] > 0) & (ts["Принято"] == 0)][["slot", "Пропущено", "Пропущено_без_оператора", "Прочие_статусы", "Всего"]]
-
-    return {
-        "kpi": kpi,
-        "timeseries": ts,
-        "dispositions": disp,
-        "operators": ops,
-        "pivot_accepted": piv_acc,
-        "pivot_missed": piv_mis,
-        "skills": skills,
-        "bad_slots": bad,
-        "events": df.sort_values("dt_start").reset_index(drop=True),
+    kpi = {
+        "Принято (ANS+CONN)": int(d["is_accepted"].sum()),
+        "Пропущено (ABAN, по выбранным skills)": int(d["is_missed_watched"].sum()),
+        "  ├─ пропущено оператором": int(d["missed_with_agent"].sum()),
+        "  └─ без оператора": int(d["missed_no_agent"].sum()),
+        "Прочие статусы": int(d["is_other"].sum()),
+        "Всего событий": int(len(d)),
     }
+    denom = kpi["Принято (ANS+CONN)"] + kpi["Пропущено (ABAN, по выбранным skills)"]
+    kpi["% пропущенных (ABAN/(ANS+CONN+ABAN))"] = 0.0 if denom == 0 else round(100.0 * kpi["Пропущено (ABAN, по выбранным skills)"] / denom, 2)
+    out["kpi"] = pd.DataFrame([kpi])
 
-def safe_reindex_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Главный фикс твоего KeyError: даже если колонки отсутствуют — добавим их с нулями."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=cols)
-    out = df.reindex(columns=cols)
-    return out.fillna(0).astype(int)
+    disp = (
+        d.groupby("disposition", dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+    )
+    out["dispositions"] = disp
+
+    # Топ операторов по пропущенным (только where agent известен)
+    ops = d[d["agent_code"].str.strip() != ""].groupby("agent_name").agg(
+        Принято=("is_accepted", "sum"),
+        Пропущено=("is_missed_watched", "sum"),
+        Всего=("disposition", "size")
+    ).reset_index()
+    denom2 = (ops["Принято"] + ops["Пропущено"]).replace(0, pd.NA)
+    ops["% пропущенных"] = (100.0 * ops["Пропущено"] / denom2).fillna(0.0).round(2)
+    ops = ops.sort_values(["Пропущено", "Принято"], ascending=[False, False])
+    out["operators"] = ops
+
+    # Тематики по пропущенным
+    d["topic"] = d["skill_code"].map(SKILL_NAMES).fillna(d["skill_code"].replace("", "Без skill"))
+    skills = d.groupby("topic").agg(
+        Принято=("is_accepted", "sum"),
+        Пропущено=("is_missed_watched", "sum"),
+        Всего=("disposition", "size")
+    ).reset_index().sort_values(["Пропущено", "Принято"], ascending=[False, False])
+    out["topics"] = skills
+
+    out["events"] = d.sort_values("dt_start").reset_index(drop=True)
+    return out
 
 
-# -------------------------
-# UI
-# -------------------------
+# -------------------- UI --------------------
 
-st.set_page_config(page_title="Avaya CMS: смены (ночь/день)", layout="wide")
-st.title("Avaya CMS — анализ смен (ночь/день)")
-
-if "mode" not in st.session_state:
-    st.session_state.mode = "night"
+st.set_page_config(page_title="Avaya: ночь/день", layout="wide")
+st.title("Avaya Call Records — анализ смен")
 
 with st.sidebar:
-    st.header("Файл")
-    html_file = st.file_uploader("HTML отчёт Avaya", type=["html", "htm"])
+    st.header("Файлы")
+    html = st.file_uploader("HTML отчёт Avaya", type=["html", "htm"])
+    mp_file = st.file_uploader("Маппинг операторов (CSV/XLSX) — опционально", type=["csv", "txt", "xlsx", "xls"])
 
     st.divider()
     st.header("Смена")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Ночь", use_container_width=True):
-            st.session_state.mode = "night"
-    with c2:
-        if st.button("День", use_container_width=True):
-            st.session_state.mode = "day"
-
-    mode = st.radio("Режим", options=["night", "day", "custom"], format_func=lambda x: SHIFT_PRESETS[x].name, index=["night","day","custom"].index(st.session_state.mode))
-    st.session_state.mode = mode
-
-    if mode == "custom":
-        st.caption("Если конец меньше начала — смена через полночь.")
-        sh = st.number_input("Старт: час", 0, 23, NIGHT_START[0])
-        sm = st.number_input("Старт: мин", 0, 59, NIGHT_START[1])
-        eh = st.number_input("Конец: час", 0, 23, NIGHT_END[0])
-        em = st.number_input("Конец: мин", 0, 59, NIGHT_END[1])
-        SHIFT_PRESETS["custom"] = ShiftSpec("Кастом", (int(sh), int(sm)), (int(eh), int(em)), None)
-
-    shift = SHIFT_PRESETS[mode]
+    mode = st.radio("Режим", ["Ночь", "День"], horizontal=True)
+    shift = SHIFT_NIGHT if mode == "Ночь" else SHIFT_DAY
 
     st.divider()
-    st.header("Правила")
-    only_watched_for_missed = st.checkbox("Пропущено считать только по skills", value=(mode == "night"))
-    watched_skills = st.multiselect("Skills для пропущенных", options=sorted(set(WATCHED_SKILLS_DEFAULT)), default=WATCHED_SKILLS_DEFAULT)
+    st.header("Фильтрация")
+    watched_skills = st.multiselect("Skills, которые считать для ABAN", options=sorted(set(WATCHED_SKILLS_DEFAULT)), default=WATCHED_SKILLS_DEFAULT)
 
     st.divider()
-    st.header("Хвосты")
-    enable_leftovers = st.checkbox("Убирать операторов-«хвостов» (только начало смены)", value=(mode == "night"))
-    leftover_min = st.number_input("Окно начала (мин)", 10, 240, DEFAULT_LEFTOVER_MIN, step=5)
-
-    st.divider()
-    st.header("Наглядность")
+    st.header("Отображение")
     top_n = st.slider("Топ N", 3, 30, 10)
-    max_pivot_cols = st.slider("Макс операторов в матрице", 3, 60, 15)
-    show_raw = st.checkbox("Показывать сырые события", value=False)
-    show_explain = st.checkbox("Пояснения для новичков (что означает каждая цифра)", value=True)
+    show_events = st.checkbox("Показать события (таблица)", value=False)
 
-    st.divider()
-    st.header("Операторы (код → имя)")
-    show_mapping = st.checkbox("Показать настройки/редактор маппинга", value=False)
-
-    # Маппинг: хранится в session_state, чтобы можно было дополнять
-    if "agent_map" not in st.session_state:
-        st.session_state.agent_map = dict(DEFAULT_AGENT_MAP)
-
-    if show_mapping:
-        mapping_file = st.file_uploader("Загрузить маппинг CSV/XLSX", type=["csv", "txt", "xlsx", "xls"])
-        pasted = st.text_area("Вставь текст из реестра (берём только строки 'Оператор - ... (код)')", height=150)
-
-        colA, colB, colC = st.columns(3)
-        with colA:
-            if st.button("Добавить из файла", use_container_width=True) and mapping_file is not None:
-                st.session_state.agent_map.update(load_mapping_file(mapping_file))
-        with colB:
-            if st.button("Добавить из текста", use_container_width=True) and pasted:
-                st.session_state.agent_map.update(extract_agents_from_registry_text(pasted))
-        with colC:
-            if st.button("Сбросить к встроенным", use_container_width=True):
-                st.session_state.agent_map = dict(DEFAULT_AGENT_MAP)
-
-        # Редактор (по кнопке/чекбоксу)
-        df_map = pd.DataFrame(
-            sorted(st.session_state.agent_map.items(), key=lambda x: x[0]),
-            columns=["agent_code", "agent_name"],
-        )
-        edited = st.data_editor(df_map, use_container_width=True, num_rows="dynamic", key="map_editor")
-        # сохранить изменения
-        try:
-            edited = edited.fillna("")
-            new_map = {}
-            for _, r in edited.iterrows():
-                c = str(r["agent_code"]).strip()
-                n = str(r["agent_name"]).strip()
-                if c and n:
-                    new_map[c] = n
-            st.session_state.agent_map = new_map
-        except Exception:
-            pass
-
-        st.download_button(
-            "Скачать текущий маппинг (CSV)",
-            data=pd.DataFrame(sorted(st.session_state.agent_map.items()), columns=["agent_code","agent_name"]).to_csv(index=False).encode("utf-8"),
-            file_name="agent_mapping.csv",
-            mime="text/csv",
-        )
-
-if html_file is None:
-    st.info("Загрузи HTML отчёт Avaya слева, потом выбирай Ночь/День и дату смены.")
+if html is None:
+    st.info("Загрузи HTML отчёт слева.")
     st.stop()
 
-# Парсинг + нормализация
-df_raw = parse_avaya_html(html_file.getvalue())
-df = normalize_calls(df_raw)
-
+raw = parse_html_to_raw_df(html.getvalue())
+df = normalize(raw)
 if df.empty:
-    st.error("Не смог распознать Avaya-таблицу (нужны колонки: Дата, Время нач., Размещение).")
+    st.error("Не смог распарсить отчёт. Нужны колонки: Дата, Время нач., Размещение (и желательно Split/Skill, Имена пользователей).")
     st.stop()
 
-# Применяем маппинг
-agent_map = st.session_state.get("agent_map", dict(DEFAULT_AGENT_MAP))
-df = apply_agent_map(df, agent_map)
+mp = load_mapping(mp_file)
+df = apply_mapping(df, mp)
 
-# Выбор даты смены (если в файле несколько дней)
-dates = available_shift_dates(df, shift)
-if len(dates) <= 1:
-    base_date = dates[0] if dates else None
-    if base_date:
-        st.caption(f"В файле найдена 1 смена для режима: {base_date.strftime('%d.%m.%Y')}")
-else:
-    options = ["Все смены в файле"] + [d.strftime("%d.%m.%Y") for d in dates]
-    chosen = st.selectbox("Дата смены (если в HTML несколько дней):", options=options, index=0)
-    base_date = None if chosen == "Все смены в файле" else datetime.strptime(chosen, "%d.%m.%Y").date()
+# выбор дня (если в файле несколько дней)
+dates = shift_dates(df, shift)
+opts = ["Все смены в файле"] + [d.strftime("%d.%m.%Y") for d in dates]
+chosen = st.selectbox("Дата смены (если в файле несколько дней):", options=opts, index=0)
+base = None if chosen == "Все смены в файле" else datetime.strptime(chosen, "%d.%m.%Y").date()
 
-df_shift, window = filter_by_shift(df, shift, base_date)
+df_shift, win = filter_shift(df, shift, base)
 if df_shift.empty:
-    st.warning("В выбранном окне смены нет событий. Попробуй другую дату/режим.")
+    st.warning("В выбранном окне смены нет событий.")
     st.stop()
 
-excluded = []
-if enable_leftovers and window is not None:
-    df_shift, excluded = drop_leftovers(df_shift, window, int(leftover_min))
-
-metrics = compute_metrics(
-    df_shift=df_shift,
-    watched_skills=[str(x) for x in watched_skills],
-    only_watched_for_missed=only_watched_for_missed,
-)
+metrics = compute(df_shift, watched_skills)
 
 # Заголовок окна
-if window is not None:
-    st_dt, en_dt = window
-    st.subheader(f"Окно анализа: {st_dt:%d.%m.%Y %H:%M} → {en_dt:%d.%m.%Y %H:%M} ({shift.name})")
-else:
-    st.subheader(f"Окно анализа: {shift.name}")
+if win:
+    s, e = win
+    st.subheader(f"Окно анализа: {s:%d.%m.%Y %H:%M} → {e:%d.%m.%Y %H:%M} ({shift.name})")
 
-if excluded:
-    st.caption("Исключены «хвосты»: " + ", ".join(excluded[:20]) + (" ..." if len(excluded) > 20 else ""))
+# KPI — сразу “сходится”
+k = metrics["kpi"].iloc[0].to_dict()
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Принято (ANS+CONN)", k["Принято (ANS+CONN)"])
+c2.metric("Пропущено (ABAN)", k["Пропущено (ABAN, по выбранным skills)"])
+c3.metric("Без оператора (ABAN)", k["  └─ без оператора"])
+c4.metric("Прочие статусы", k["Прочие статусы"])
+c5.metric("Всего событий", k["Всего событий"])
 
-# KPI
-kpi = metrics["kpi"].iloc[0].to_dict()
+st.caption("Формула: % пропущенных = ABAN / (ANS+CONN+ABAN) по выбранным skills.")
+st.metric("% пропущенных", f'{k["% пропущенных (ABAN/(ANS+CONN+ABAN))"]}%')
 
-# Главные цифры — чтобы они "складывались" понятно
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-col1.metric("Принято", int(kpi["Принято (ANS+CONN)"]), help="Считаем как ANS + CONN")
-col2.metric("Пропущено (ABAN)", int(kpi["Пропущено всего (ABAN)"]), help="ABAN. Если включён фильтр skills — считаем только по выбранным skills")
-col3.metric("ABAN оператором", int(kpi["Пропущено оператором"]), help="ABAN, где указан оператор (agent заполнен)")
-col4.metric("ABAN без оператора", int(kpi["Пропущено без оператора"]), help="ABAN, где оператор не указан (agent пустой)")
-col5.metric("Прочие статусы", int(kpi["Прочие статусы"]), help="FDISC/FBUSY/… — всё, что не ANS/CONN и не ABAN")
-col6.metric("Всего событий", int(kpi["Всего событий"]), help="Принято + ABAN + Прочие статусы (в рамках выбранной смены)")
-
-if show_explain:
-    st.markdown("#### Как читать эти цифры")
-    st.markdown(
-        """
-- **Всего событий** = **Принято (ANS+CONN)** + **Пропущено (ABAN)** + **Прочие статусы**  
-- **% пропущенных** (основная метрика) = **ABAN / (ANS+CONN + ABAN)**  
-- **ABAN без оператора** — это часть ABAN, где `agent` пустой (обычно особенности очереди/маршрутизации), поэтому показываем отдельно
-        """
-    )
-
-    breakdown = pd.DataFrame([
-        {"Компонент": "Принято (ANS+CONN)", "Кол-во": int(kpi["Принято (ANS+CONN)"])},
-        {"Компонент": "Пропущено оператором (ABAN + agent)", "Кол-во": int(kpi["Пропущено оператором"])},
-        {"Компонент": "Пропущено без оператора (ABAN без agent)", "Кол-во": int(kpi["Пропущено без оператора"])},
-        {"Компонент": "Прочие статусы (FDISC/FBUSY/…)", "Кол-во": int(kpi["Прочие статусы"])},
-    ])
-    breakdown.loc[len(breakdown)] = {"Компонент": "ИТОГО (должно = Всего событий)", "Кол-во": int(breakdown["Кол-во"].sum())}
-    st.dataframe(breakdown, use_container_width=True)
-
-    pct_tbl = pd.DataFrame([{
-        "% пропущенных (ABAN / (ANS+CONN + ABAN))": f'{kpi["% пропущенных от (принято+пропущено)"]}%',
-        "% пропущенных от всех событий": f'{kpi["% пропущенных от всех событий"]}%',
-        "% ABAN без оператора среди ABAN": f'{kpi["% без оператора среди ABAN"]}%',
-    }])
-    st.dataframe(pct_tbl, use_container_width=True)
-
-    st.markdown("#### Какие статусы встречаются в файле")
+# Таблица по статусам — объясняет “почему всего больше”
+with st.expander("Пояснение: из чего складывается 'Всего'"):
+    st.write("**Всего событий** = Принято (ANS+CONN) + Пропущено (ABAN по выбранным skills) + Прочие статусы.")
     st.dataframe(metrics["dispositions"], use_container_width=True)
 
-# Динамика
-st.markdown("### Динамика по получасам")
-ts = metrics["timeseries"].set_index("slot")[["Принято", "Пропущено", "Прочие_статусы", "Пропущено_без_оператора"]]
-st.line_chart(ts)
-
 # Топы
-st.markdown("### Топы")
-ops = metrics["operators"]
-skills = metrics["skills"]
-
 colA, colB = st.columns(2)
 with colA:
-    st.markdown(f"**Топ-{top_n} операторов по пропущенным**")
-    st.dataframe(ops.head(top_n), use_container_width=True)
+    st.markdown(f"### Топ-{top_n} операторов по пропущенным")
+    st.dataframe(metrics["operators"].head(top_n), use_container_width=True)
 with colB:
-    st.markdown(f"**Топ-{top_n} тематик по пропущенным**")
-    st.dataframe(skills.head(top_n), use_container_width=True)
-
-# Матрица (без KeyError)
-st.markdown("### Матрица (получас × оператор)")
-piv_acc = metrics["pivot_accepted"]
-piv_mis = metrics["pivot_missed"]
-
-# список операторов берём из объединения pivot-колонок и ops (чтобы не ловить KeyError)
-all_ops = sorted(set((list(piv_acc.columns) if not piv_acc.empty else []) + (list(piv_mis.columns) if not piv_mis.empty else []) + (ops["agent_name"].tolist() if not ops.empty else [])))
-# дефолт: top по пропущенным + ограничение max_pivot_cols
-default_ops = (ops["agent_name"].tolist() if not ops.empty else [])[: max_pivot_cols]
-default_ops = [o for o in default_ops if o in all_ops][:max_pivot_cols]
-
-selected_ops = st.multiselect("Выбери операторов для матрицы:", options=all_ops, default=default_ops)
-
-if selected_ops:
-    acc_show = safe_reindex_columns(piv_acc, selected_ops)
-    mis_show = safe_reindex_columns(piv_mis, selected_ops)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Принятые**")
-        st.dataframe(acc_show, use_container_width=True)
-    with c2:
-        st.markdown("**Пропущенные**")
-        st.dataframe(mis_show, use_container_width=True)
-else:
-    st.caption("Выбери хотя бы одного оператора, чтобы показать матрицу.")
-
-# Аномалии
-st.markdown("### Аномалии")
-st.dataframe(metrics["bad_slots"], use_container_width=True)
+    st.markdown(f"### Топ-{top_n} тематик по пропущенным")
+    st.dataframe(metrics["topics"].head(top_n), use_container_width=True)
 
 # Экспорт
-st.markdown("### Экспорт")
-events = metrics["events"]
-st.download_button(
-    "Скачать CSV событий (выбранная смена)",
-    data=events.to_csv(index=False).encode("utf-8"),
-    file_name="avaya_shift_events.csv",
-    mime="text/csv",
-)
+csv = metrics["events"].to_csv(index=False).encode("utf-8")
+st.download_button("Скачать CSV событий (фильтрованная смена)", data=csv, file_name="avaya_shift_events.csv", mime="text/csv")
 
-if show_raw:
-    st.markdown("### Сырые события (первые 2000 строк)")
-    st.dataframe(events.head(2000), use_container_width=True)
+if show_events:
+    st.markdown("### События (первые 2000 строк)")
+    st.dataframe(metrics["events"].head(2000), use_container_width=True)
